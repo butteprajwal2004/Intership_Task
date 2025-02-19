@@ -1,0 +1,85 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import models, transforms
+from PIL import Image
+import matplotlib.pyplot as plt
+
+# Load and preprocess images
+def load_image(image_path, max_size=400):
+    image = Image.open(image_path).convert('RGB')
+    size = max_size if max(image.size) > max_size else max(image.size)
+    transform = transforms.Compose([
+        transforms.Resize((size, size)),
+        transforms.ToTensor(),
+    ])
+    image = transform(image).unsqueeze(0)
+    return image
+
+# Define content and style losses
+class ContentLoss(nn.Module):
+    def __init__(self, target):
+        super(ContentLoss, self).__init__()
+        self.target = target.detach()
+    def forward(self, x):
+        return nn.functional.mse_loss(x, self.target)
+
+class StyleLoss(nn.Module):
+    def __init__(self, target):
+        super(StyleLoss, self).__init__()
+        self.target = self.gram_matrix(target).detach()
+    def gram_matrix(self, x):
+        _, c, h, w = x.size()
+        features = x.view(c, h * w)
+        gram = torch.mm(features, features.t())
+        return gram.div(c * h * w)
+    def forward(self, x):
+        gram_x = self.gram_matrix(x)
+        return nn.functional.mse_loss(gram_x, self.target)
+
+# Load pre-trained VGG19
+model = models.vgg19(pretrained=True).features.eval()
+
+def get_features(image, model):
+    layers = {'0': 'conv1_1', '5': 'conv2_1', '10': 'conv3_1', '19': 'conv4_1', '21': 'conv4_2', '28': 'conv5_1'}
+    features = {}
+    x = image
+    for name, layer in model._modules.items():
+        x = layer(x)
+        if name in layers:
+            features[layers[name]] = x
+    return features
+
+def transfer_style(content_path, style_path, num_steps=300, style_weight=1e6, content_weight=1):
+    content = load_image(content_path)
+    style = load_image(style_path)
+    generated = content.clone().requires_grad_(True)
+    optimizer = optim.Adam([generated], lr=0.003)
+    content_features = get_features(content, model)
+    style_features = get_features(style, model)
+    
+    style_losses = [StyleLoss(style_features[layer]) for layer in ['conv1_1', 'conv2_1', 'conv3_1', 'conv4_1', 'conv5_1']]
+    content_loss = ContentLoss(content_features['conv4_2'])
+    
+    for step in range(num_steps):
+        optimizer.zero_grad()
+        generated_features = get_features(generated, model)
+        content_loss_val = content_loss(generated_features['conv4_2']) * content_weight
+        style_loss_val = sum([loss(generated_features[layer]) for layer, loss in zip(['conv1_1', 'conv2_1', 'conv3_1', 'conv4_1', 'conv5_1'], style_losses)]) * style_weight
+        
+        total_loss = content_loss_val + style_loss_val
+        total_loss.backward()
+        optimizer.step()
+        
+        if step % 50 == 0:
+            print(f"Step {step}: Total Loss: {total_loss.item()}")
+    
+    return generated.detach()
+
+# Example Usage
+if __name__ == "__main__":
+    styled_image = transfer_style("content.jpg", "style.jpg")
+    styled_image = styled_image.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    plt.imshow(styled_image)
+    plt.axis("off")
+    plt.show()
